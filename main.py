@@ -3,18 +3,17 @@ import time
 import subprocess
 import yt_dlp
 from collections import deque
-from gemini_api import translate_and_generate_tags
+from gemini_api import gemini_extract_entities, translate_and_generate_tags
+from bangumi_api import get_bangumi_context, get_character_info
 from download_video import download_video
+from yt_dlp.utils import DownloadError
 
-# 已记录的最后视频 ID
 last_video_ids = {}
 
-# 视频队列
 video_queue = deque()
 
-# 监控播放列表
 playlist_urls = [
-    "https://www.youtube.com/playlist?list=UUb7pea6mapotr_bULeklChA",
+    "https://www.youtube.com/playlist?list=UUDb0peSmF5rLX7BvuTcJfCw",
 ]
 CHECK_INTERVAL = 60
 download_dir = "downloads"
@@ -49,7 +48,6 @@ def get_latest_video_from_playlist(url):
     return None, None, None
 
 def get_video_duration(video_url):
-    # 默认不使用代理
     ydl_opts = {
         'quiet': True,
         'cookiesfrombrowser': ('firefox', 'ua6vti8s.default'),
@@ -60,42 +58,53 @@ def get_video_duration(video_url):
             info = ydl.extract_info(video_url, download=False)
             return info.get('duration', 0)
     except Exception as e:
-        if "This video is not available in your country" in str(e) or "Sign in to confirm you’re not a bot" in str(e):
-            print(f"[地区限制] 检测到访问受限，切换代理重试：{e}")
-
-            # 使用代理重试
-            ydl_opts['proxy'] = 'socks5://127.0.0.1:1081'
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=False)
-                return info.get('duration', 0)
-        else:
-            raise e
-
+        raise e
 
 def process_queue():
-    """逐个处理排队的视频"""
     while video_queue:
         title, video_url = video_queue.popleft()
-
         video_file_name, cover_file_name, description, source_link = download_video(video_url)
+
         video_file = os.path.join(download_dir, video_file_name)
         cover_path = os.path.join(download_dir, cover_file_name)
 
-        translated_data = translate_and_generate_tags(title)
+        entities = gemini_extract_entities(title)
+        print(f"[信息] 提取结果：{entities}")
+
+        context_info = ""
+        if entities["work"]:
+            context_info += get_bangumi_context(entities["work"]) + "\n"
+        if entities["characters"]:
+            for name in entities["characters"]:
+                char_info = get_character_info(name)
+                if char_info:
+                    context_info += char_info + "\n"
+
+        translated_data = translate_and_generate_tags(title, context_info.strip())
+        if not translated_data:
+            print("[跳过] Gemini 翻译失败，跳过该视频")
+            return
 
         lines = [line.strip() for line in translated_data.strip().splitlines() if line.strip()]
-
-        if len(lines) < 2:
-            raise ValueError(f"Gemini API 返回格式不正确:\n{translated_data}")
+        if not lines[0].startswith("翻译：") or not lines[1].startswith("标签："):
+            raise ValueError(f"Gemini 返回格式异常：\n{translated_data}")
 
         translated_title = lines[0].replace("翻译：", "").strip()
         tags_line = lines[1].replace("标签：", "").strip() or "YouTube搬运"
 
-        post_to_bilibili(video_file, translated_title, description, tags_line, cover_path, source_link)
+        try:
+            post_to_bilibili(
+                video_file, translated_title, description, tags_line, cover_path, source_link
+            )
+        except Exception as e:
+            print(f"[上传失败] {e}")
+        finally:
+            if os.path.exists(video_file):
+                os.remove(video_file)
+            if os.path.exists(cover_path):
+                os.remove(cover_path)
+            print(f"[清理] 已删除本地文件：{video_file} 与 {cover_path}")
 
-        os.remove(video_file)
-        os.remove(cover_path)
-        print(f"[完成] 已上传 {translated_title}，并删除本地文件。")
 
 def check_for_new_videos():
     """检测所有 playlist 是否有新视频"""
@@ -105,21 +114,30 @@ def check_for_new_videos():
             print(f"[警告] 无法获取 {playlist_url} 的最新视频")
             continue
 
-        # 首次记录
         if playlist_url not in last_video_ids:
             last_video_ids[playlist_url] = video_id
             print(f"[首次记录] {playlist_url} 最新视频为 {video_id}")
             continue
 
-        # 未更新
         if video_id == last_video_ids[playlist_url]:
             continue
 
-        # 新视频，更新记录
         last_video_ids[playlist_url] = video_id
 
-        # 检查视频时长
-        duration = get_video_duration(video_url)
+        try:
+            duration = get_video_duration(video_url)
+        except DownloadError as e:
+            error_msg = str(e)
+            if "not made this video available in your country" in error_msg:
+                print(f"[跳过] 视频因地区限制无法访问：{title}")
+                continue
+            else:
+                print(f"[异常] 无法获取视频时长：{error_msg}")
+                continue
+        except Exception as e:
+            print(f"[异常] 获取视频时长失败：{e}")
+            continue
+
         print(f"[检测到新视频] {title}，时长 {duration} 秒")
         if duration > 6 * 60:
             print(f"[跳过] 视频时长超过 6 分钟，未搬运：{title}")
@@ -129,7 +147,6 @@ def check_for_new_videos():
         print(f"[排队] 已加入搬运队列：{title}")
 
 def main():
-    """持续运行"""
     while True:
         try:
             check_for_new_videos()

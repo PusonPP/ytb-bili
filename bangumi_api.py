@@ -3,56 +3,16 @@ import os
 import requests
 
 BANGUMI_API_BASE = "https://api.bgm.tv"
-USER_AGENT = "YtbBiliScript/1.0.0"
+headers = {
+    "User-Agent": "ytb-bili-bot/1.0",
+    "Accept": "application/json"
+}
 
-def extract_work_name(title: str) -> str:
-    """
-    从视频标题中尝试提取可能的作品名称。
-    返回提取的名称；如果无法识别则返回空字符串。
-    """
-    m = re.search(r'《(.+?)》', title)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r'【(.+?)】', title)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r'「(.+?)」', title)
-    if m:
-        return m.group(1).strip()
-    for sep in [':', '：', '-', '—']:
-        if sep in title:
-            candidate = title.split(sep, 1)[0].strip()
-            if candidate:
-                return candidate
-    m = re.search(r'^(.+?)(第[\d一二三四五六七八九十]+[话話])', title)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r'^(.+?)(EP\s?\d+)', title, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r'^(.+?)(Episode\s?\d+)', title, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    candidate = title.strip()
-    candidate = re.sub(r'[\d\-、。．\.!\s]+$', '', candidate)
-    return candidate.strip()
-
-def get_bangumi_context(title: str) -> str:
-    """
-    给定一个视频原始标题，识别其中的作品名称并从Bangumi获取该作品的信息，
-    返回格式化后的上下文提示字符串（含译名、原名、类别、年份、标签、staff等）。
-    若未能获取信息则返回空字符串。
-    """
-    work_name = extract_work_name(title)
+def get_bangumi_context(work_name: str) -> str:
     if not work_name:
         return ""
-
     search_url = f"{BANGUMI_API_BASE}/v0/search/subjects"
     payload = {"keyword": work_name, "sort": "match"}
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    token = os.getenv("BANGUMI_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     try:
         response = requests.post(search_url, json=payload, params={"limit": 1}, headers=headers, timeout=10)
         response.raise_for_status()
@@ -141,3 +101,56 @@ def get_bangumi_context(title: str) -> str:
 
     return "\n".join(info_lines)
 
+def get_character_info(char_name: str) -> str:
+    search_url = f"{BANGUMI_API_BASE}/v0/search/characters"
+    payload = {
+        "keyword": char_name,
+        "limit": 1,
+        "filter": {},
+        "nsfw": False
+    }
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "ytb-bili-bot/1.0"
+    }
+
+    try:
+        resp = requests.post(search_url, json=payload, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("data"):
+            return ""
+
+        char = data["data"][0]
+        char_id = char["id"]
+
+        detail_url = f"{BANGUMI_API_BASE}/v0/characters/{char_id}"
+        detail_resp = requests.get(detail_url, headers=headers, timeout=10)
+        detail_resp.raise_for_status()
+        detail = detail_resp.json()
+
+        name = detail.get("name", "").strip()
+        name_cn = detail.get("name_cn", "").strip()
+        summary = detail.get("summary", "").strip()
+
+        if not name_cn and "infobox" in detail:
+            for item in detail["infobox"]:
+                if item.get("key") == "简体中文名":
+                    name_cn = item.get("value", "").strip()
+                    break
+
+        lines = []
+        if name_cn:
+            lines.append(f"角色标准译名：{name_cn}")
+        if name and name != name_cn:
+            lines.append(f"角色原名：{name}")
+        if summary:
+            lines.append(f"角色简介：{summary}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        print(f"[Bangumi API] 角色查询异常：{e}")
+        return ""
