@@ -13,7 +13,7 @@ def download_video(video_url):
         'outtmpl': os.path.join(download_dir, '%(title)s.%(ext)s'),
         'writeinfojson': True,
         'writethumbnail': True,
-        'cookiesfrombrowser': ('firefox', 'ua6vti8s.default'),
+        'cookiesfrombrowser': ('firefox',),
         'quiet': False,
     }
 
