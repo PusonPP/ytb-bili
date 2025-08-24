@@ -113,7 +113,7 @@ def get_character_info(char_name: str) -> str:
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "ytb-bili-bot/1.0"
+        "User-Agent": "ytb-bili-bot/1.0 (https://github.com/PusonPP/ytb-bili)"
     }
 
     try:
