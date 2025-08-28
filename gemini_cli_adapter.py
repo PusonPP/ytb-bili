@@ -48,23 +48,21 @@ def _has_gemini_cli() -> bool:
 
 def _run_gemini_cli(prompt: str, model: str = DEFAULT_MODEL) -> Optional[str]:
     """
-    优先用 CLI；若启用了沙箱但容器引擎不可用或报错，则自动无沙箱重试。
-    - 通过环境变量控制：
-      GEMINI_CLI_SANDBOX=1/true   → 优先尝试沙箱（需 docker 或 podman）
-      GEMINI_CLI_REQUIRE_SANDBOX=1 → 必须沙箱，失败就放弃（不做无沙箱重试）
+    强制无沙箱执行 Gemini CLI：
+    1) 清理一切沙箱相关环境变量；
+    2) 先尝试 --no-sandbox（若新 CLI 支持），不支持则回退；
+    3) 若 CLI 返回非 0，则打印裁剪后的 stdout/stderr 并返回 None 让上层走 API 回退。
     """
     if not _has_gemini_cli():
         return None
 
     env = os.environ.copy()
+    # 渲染更干净的输出
     env.setdefault("NO_COLOR", "1")
     env.setdefault("CI", "1")
-
-    want_sandbox = os.getenv("GEMINI_CLI_SANDBOX", "").lower() in ("1", "true", "yes", "on")
-    require_sandbox = os.getenv("GEMINI_CLI_REQUIRE_SANDBOX", "").lower() in ("1", "true", "yes", "on")
-    has_docker = shutil.which("docker") is not None
-    has_podman = shutil.which("podman") is not None
-    can_sandbox = (has_docker or has_podman)
+    # —— 关键：彻底禁用沙箱相关环境变量（无论谁在外面开了都失效）——
+    for k in ("GEMINI_CLI_SANDBOX", "GEMINI_CLI_REQUIRE_SANDBOX", "GEMINI_SANDBOX"):
+        env.pop(k, None)
 
     def _run(args):
         try:
@@ -78,29 +76,32 @@ def _run_gemini_cli(prompt: str, model: str = DEFAULT_MODEL) -> Optional[str]:
         except Exception as e:
             print(f"[Gemini CLI] 调用异常：{e}"); return None
 
-    # --- 优先尝试“带沙箱”的调用（当且仅当用户要求且系统具备容器引擎） ---
-    if want_sandbox and can_sandbox:
-        args = ["gemini", "--sandbox", "-m", model, "-p", prompt]
-        res = _run(args)
-        if res and res.returncode == 0:
+    # 1) 先试带 --no-sandbox（新版本 CLI 支持）
+    args_try = ["gemini", "--no-sandbox", "-m", model, "-p", prompt]
+    res = _run(args_try)
+    if res:
+        if res.returncode == 0:
             cleaned = _clean_cli_output(res.stdout)
             if cleaned:
                 return cleaned
-        # 沙箱失败：
-        if res:
-            out = (res.stdout or "").strip(); err = (res.stderr or "").strip()
-            print(f"[Gemini CLI] 沙箱模式失败：code={res.returncode}, stdout={out[:200]}, stderr={err[:200]}")
-        if require_sandbox:
-            # 强制要求沙箱时，不做无沙箱重试
-            return None
+        else:
+            out = (res.stdout or "").strip()
+            err = (res.stderr or "").strip()
+            # 如果是“未知选项/不支持 --no-sandbox”，退回普通调用；否则直接失败
+            if "unknown option" in err.lower() or "unrecognized option" in err.lower():
+                pass  # 继续走普通版本
+            else:
+                print(f"[Gemini CLI] 非 0 退出码：{res.returncode}, stdout={out[:200]}, stderr={err[:200]}")
+                return None
 
-    # --- 无沙箱调用（默认走这条；或沙箱失败后降级） ---
-    args = ["gemini", "-m", model, "-p", prompt]
-    res = _run(args)
+    # 2) 回退到普通（无 --no-sandbox）的调用
+    args_plain = ["gemini", "-m", model, "-p", prompt]
+    res = _run(args_plain)
     if not res:
         return None
     if res.returncode != 0:
-        out = (res.stdout or "").strip(); err = (res.stderr or "").strip()
+        out = (res.stdout or "").strip()
+        err = (res.stderr or "").strip()
         print(f"[Gemini CLI] 非 0 退出码：{res.returncode}, stdout={out[:200]}, stderr={err[:200]}")
         return None
 

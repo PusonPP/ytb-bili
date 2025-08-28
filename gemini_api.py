@@ -36,6 +36,36 @@ _NOISE_PATTERNS = [
     re.compile(r"^\[Sandbox\].*$", re.IGNORECASE),
 ]
 
+# —— 分区映射：名称↔tid（用于容错解析）——
+TID_MAP_NAME2ID = {
+    "单机游戏": 4,
+    "手机游戏": 172,
+    "网络游戏": 65,
+    "动画资讯": 51,
+    "音乐": 130,
+}
+TID_SET = set(TID_MAP_NAME2ID.values())
+
+def _parse_tid_from_line(line: str) -> int:
+    """
+    支持两种输入：
+      1) '分区：172'  -> 直接取数字且校验是否在白名单里
+      2) '分区：手机游戏' -> 名称映射到 tid
+    都失败则回落到 51（动画资讯）
+    """
+    import re
+    raw = (line or "").strip()
+    if not raw.startswith("分区："):
+        return 51
+    value = raw.split("：", 1)[1].strip()
+    # 优先找数字
+    m = re.search(r"\d+", value)
+    if m:
+        tid = int(m.group())
+        return tid if tid in TID_SET else 51
+    # 再尝试中文名
+    return TID_MAP_NAME2ID.get(value, 51)
+
 def _strip_ansi(s: str) -> str:
     return _ANSI_RE.sub("", s or "")
 
@@ -209,40 +239,61 @@ def _ask_gemini_text(prompt: str, model_name: str = DEFAULT_MODEL) -> Optional[s
 # ========== 业务函数（对外接口保持不变） ==========
 def translate_and_generate_tags(title_ori: str, context_info: str):
     """
-    返回严格两行：
+    现在返回三行（向后兼容：旧代码只取前两行也能工作）：
       翻译：<翻译后的中文标题>
       标签：<标签1>, <标签2>, ..., <标签10>
+      分区：<tid>
+    其中 <tid> 只能是 {4, 172, 65, 51, 130} 中的一个；若模型判断不了，则输出 51。
     """
     ctx = (f"{context_info}\n" if context_info else "")
-    prompt = f"""{ctx}你是一名擅长中日双语的ACGN相关情报编辑，任务是将日语/英文ACGN情报标题翻译成中文，并给出 10 个中文标签。
-要求：
-1) 动画作品名称使用公认中文译名，如不确定名称请自行搜索查询分析。
-2) 标题可创意改写，突出情报重点，并使标题具有吸引力。如果情况合适，你可以在标题前加一个【】，并在其中用不多于6个字来简短概括情报类型和内容
-3) 严格只输出下列两行（不要额外说明或代码块）：
-   翻译：<翻译后的中文标题>
-   标签：<标签1>, <标签2>, ..., <标签10>
+    # —— 强约束提示词：让模型只在给定分区里单选，并“输出tid数字” —— 
+    prompt = f"""{ctx}你是一名擅长中日双语的ACGN相关情报编辑。请完成三件事：
+1) 将下面的视频原标题翻译为中文标题，你可以进行创意改写，要求突出情报重点，并使标题具有吸引力。相关作品名称需要使用公认的中文译名，如不确定名称请自行搜索查询分析。如果情况合适，你可以在标题前加一个【】，并在其中用不多于6个字来简短概括情报类型和内容。
+2) 基于视频标题生成10个相关的中文标签（逗号分隔），比如制作公司、情报类型、相关人员（声优、制作人员）、作品名称等等。
+3) 在以下分区中“只选一个最合适的分区”，并输出其对应的数字：
+   - 单机游戏：4
+   - 手机游戏：172
+   - 网络游戏：65
+   - 动画资讯：51
+   - 音乐：130
+   若以上都不太符合，请选择 51（动画资讯）。
 
-标题：{title_ori}
-    """.strip()
+严格只输出下面三行（不要额外解释、不要代码块）：
+翻译：<翻译后的中文标题>
+标签：<标签1>, <标签2>, ..., <标签10>
+分区：<tid数字，仅可为 4/172/65/51/130 之一>
 
-    raw = ask_gemini_text(prompt)
+原标题：{title_ori}
+""".strip()
+
+    raw = ask_gemini_text(prompt)  # 走适配器：强制无沙箱 + 失败回退 API
     if not raw:
         return None
 
-    trans_line, tags_line = None, None
+    trans_line, tags_line, tid_line = None, None, None
     for ln in (l.strip() for l in raw.splitlines() if l.strip()):
         if ln.startswith("翻译：") and trans_line is None:
             trans_line = ln
         elif ln.startswith("标签：") and tags_line is None:
             tags_line = ln
-        if trans_line and tags_line:
+        elif ln.startswith("分区：") and tid_line is None:
+            tid_line = ln
+        if trans_line and tags_line and tid_line:
             break
 
     if not (trans_line and tags_line):
-        # 回显原始结果，便于排查
+        # 必须至少有标题与标签；分区缺失时回落到 51
         raise ValueError(f"Gemini 返回格式异常：\n{raw}")
 
-    return f"{trans_line}\n{tags_line}"
+    # 分区行容错处理（数字/中文名都接纳；默认 51）
+    if not tid_line:
+        tid_line = "分区：51"
+    tid = _parse_tid_from_line(tid_line)
+    tid_line = f"分区：{tid}"
+
+    # 返回“三行纯文本”，便于老代码继续用“splitlines”解析
+    return f"{trans_line}\n{tags_line}\n{tid_line}"
+
 
 
 def gemini_extract_entities(title: str) -> dict:
